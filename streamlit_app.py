@@ -16,6 +16,7 @@ from canslim_rules import (DEFAULTS, combine_market, evaluate_stock,
                            market_health, verdict)
 from data_fetch import (get_fundamentals, get_histories, get_history,
                         get_market_history)
+from report import build_screener_report, build_stock_report
 
 st.set_page_config(page_title="CANSLIM Screener", page_icon="📈", layout="wide")
 
@@ -151,16 +152,19 @@ def analyze(symbol: str, hist=None):
     return fund, result, None
 
 
+def rows_df(rows) -> pd.DataFrame:
+    return pd.DataFrame(
+        [(r[0], r[1], r[2], icon(r[3]), r[4] if len(r) > 4 else "") for r in rows],
+        columns=["Metric", "Value", "Target", "", "Source & data date"])
+
+
 def letter_panel(letter: dict):
     head = f"{icon(letter['passed'])} **{letter['key']} = {letter['title']}**"
     score = f"{letter['score']}/100" if letter["score"] is not None else "no data"
     with st.expander(f"{head} — {score}", expanded=False):
         st.write(letter["summary"])
         if letter["rows"]:
-            df = pd.DataFrame(
-                [(lbl, val, tgt, icon(ok)) for lbl, val, tgt, ok in letter["rows"]],
-                columns=["Metric", "Value", "Target", ""])
-            st.table(df.set_index("Metric"))
+            st.table(rows_df(letter["rows"]).set_index("Metric"))
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +195,14 @@ with tab_stock:
 
             v = verdict(result["composite"], result["passed_count"],
                         result["scored_count"], overall_m["passed"])
+            result["verdict"] = v
             (st.success if result["composite"] and result["composite"] >= 65 else st.warning)(f"**Verdict:** {v}")
+
+            st.download_button(
+                "⬇️ Download full report (HTML, with all data sources & dates)",
+                build_stock_report(symbol, fund, result, overall_m["status"], th),
+                file_name=f"canslim_{symbol}_{pd.Timestamp.now():%Y-%m-%d}.html",
+                mime="text/html")
 
             if not result["liquidity"]["ok"]:
                 st.warning("⚠️ Fails O'Neil's liquidity sanity checks (price/volume too low) — "
@@ -208,12 +219,24 @@ with tab_stock:
                 for letter in result["letters"]:
                     letter_panel(letter)
                 with st.expander(f"{icon(result['liquidity']['ok'])} Liquidity sanity checks"):
-                    df = pd.DataFrame(
-                        [(lbl, val, tgt, icon(ok)) for lbl, val, tgt, ok in result["liquidity"]["rows"]],
-                        columns=["Metric", "Value", "Target", ""])
-                    st.table(df.set_index("Metric"))
-                if fund["sources"]:
-                    st.caption("Data sources used: " + ", ".join(fund["sources"]))
+                    st.table(rows_df(result["liquidity"]["rows"]).set_index("Metric"))
+                with st.expander("🔬 Raw data used (verify manually)"):
+                    st.caption(f"Fundamentals fetched {fund['fetched_at']} · "
+                               f"Prices: {result['price']['source']}")
+                    if fund["eps_quarters"]:
+                        st.markdown("**Quarterly EPS series** — "
+                                    + fund.get("prov", {}).get("eps_q", ""))
+                        st.table(pd.DataFrame(fund["eps_quarters"],
+                                              columns=["Quarter / report date", "EPS ($)"]))
+                    if fund["eps_annual"]:
+                        st.markdown("**Annual EPS series** — "
+                                    + fund.get("prov", {}).get("eps_annual", ""))
+                        st.table(pd.DataFrame(fund["eps_annual"],
+                                              columns=["Fiscal year", "EPS ($)"]))
+                    if fund["sources"]:
+                        st.caption("Endpoints queried: " + ", ".join(fund["sources"]))
+                    if fund["errors"]:
+                        st.caption("Endpoints that failed: " + "; ".join(fund["errors"]))
 
             with right:
                 st.subheader("Price vs moving averages (12 months)")
@@ -294,10 +317,16 @@ with tab_screen:
                         "Score": st.column_config.ProgressColumn(
                             "Score", min_value=0, max_value=100, format="%d"),
                     })
-                st.download_button(
+                dl1, dl2 = st.columns(2)
+                dl1.download_button(
                     "Download results (CSV)",
                     df.to_csv(index=False).encode(),
                     file_name="canslim_screen.csv", mime="text/csv")
+                dl2.download_button(
+                    "Download results (HTML)",
+                    build_screener_report(df, overall_m["status"], th),
+                    file_name=f"canslim_screen_{pd.Timestamp.now():%Y-%m-%d}.html",
+                    mime="text/html")
                 if overall_m["passed"] is False:
                     st.warning(f"Market check (M): **{overall_m['status']}** — O'Neil would "
                                "hold off on new buys until a confirmed uptrend.")
@@ -313,7 +342,7 @@ with tab_help:
     st.markdown(f"""
 | Letter | Book rule | Implementation |
 |---|---|---|
-| **C** | Quarterly EPS up **≥18–20%** YoY (25%+ preferred; winners averaged +70%), accelerating, confirmed by sales. Avoid comparisons vs. near-zero year-ago EPS. | Latest reported EPS vs. same quarter last year (Yahoo reported EPS, FMP fallback, net-income growth as last resort), acceleration vs. prior quarter, sales growth YoY. |
+| **C** | Quarterly EPS up **≥18–20%** YoY (25%+ preferred; winners averaged +70%), accelerating, confirmed by sales. Avoid comparisons vs. near-zero year-ago EPS. | **GAAP diluted EPS from the quarterly income statement**, date-matched to the same quarter one year earlier (verifiable against the 10-Q). Fallbacks, in order: FMP statements, Yahoo earnings-calendar street EPS (labelled — can mix GAAP/non-GAAP), net-income growth (labelled). Every row shows its source and data date. |
 | **A** | Annual EPS up **each of the last ~5 years** (one dip allowed), **25–50%** compounded growth. | Annual diluted EPS (up to 4–6 yrs of free data): years-up count, CAGR, plus ROE ≥ {int(DEFAULTS['roe_min'])}% as a quality check. |
 | **N** | Something new (product, management, industry) **and a price near new highs** emerging from a base. | % below 52-week high (default ≤ {int(DEFAULTS['off_high_max'])}%). The "new catalyst" part can't be screened — verify it yourself. |
 | **S** | Small or reasonable share count, low debt, **volume demand on rallies**. | Float size, debt/equity, 50-day up/down volume ratio ≥ {DEFAULTS['ud_vol_min']:.1f}. |
