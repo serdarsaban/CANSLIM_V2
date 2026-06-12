@@ -66,6 +66,9 @@ def _clamp(x, lo=0.0, hi=100.0):
 def price_metrics(df: pd.DataFrame) -> dict:
     close, vol = df["Close"], df["Volume"]
     out = {"last_close": float(close.iloc[-1])}
+    out["asof"] = df.index[-1].strftime("%Y-%m-%d")
+    out["source"] = (f"{df.attrs.get('source', 'price history')}, data through "
+                     f"{out['asof']} (fetched {df.attrs.get('fetched_at', '?')})")
 
     year = df.iloc[-252:] if len(df) >= 252 else df
     out["high_52w"] = float(year["High"].max())
@@ -149,14 +152,28 @@ def eval_C(f: dict, th: dict) -> dict:
         return _letter("C", "Current Quarterly Earnings", None, None, [],
                        "No quarterly earnings data available from any source.")
     accel = (gp is not None and g > gp) or None if gp is not None else None
-    rows = [
-        (f"Quarterly EPS growth YoY ({f['eps_growth_source']})",
-         _fmt(g, "%"), f">= {th['eps_q_min']:.0f}%", g >= th["eps_q_min"]),
-        ("Prior quarter EPS growth YoY", _fmt(gp, "%"),
-         "accelerating", accel),
-        ("Quarterly sales growth YoY", _fmt(s, "%"),
-         f">= {th['sales_q_min']:.0f}%", (s >= th["sales_q_min"]) if s is not None else None),
-    ]
+    prov = f.get("prov", {})
+    eps_src, sales_src = prov.get("eps_q", ""), prov.get("sales_q", "")
+    rows = []
+    if f.get("eps_pair"):
+        d0, v0, d1, v1 = f["eps_pair"]
+        rows.append(("EPS inputs used (latest vs year-ago quarter)",
+                     f"${v0:,.2f} ({d0}) vs ${v1:,.2f} ({d1})",
+                     "same fiscal quarter, 1 year apart", None, eps_src))
+    rows.append((f"Quarterly EPS growth YoY ({f['eps_growth_source']})",
+                 _fmt(g, "%"), f">= {th['eps_q_min']:.0f}%", g >= th["eps_q_min"], eps_src))
+    if f.get("eps_pair_prev"):
+        d0, v0, d1, v1 = f["eps_pair_prev"]
+        rows.append(("Prior-quarter inputs",
+                     f"${v0:,.2f} ({d0}) vs ${v1:,.2f} ({d1})", "", None, eps_src))
+    rows.append(("Prior quarter EPS growth YoY", _fmt(gp, "%"), "accelerating", accel, eps_src))
+    if f.get("sales_pair"):
+        d0, v0, d1, v1 = f["sales_pair"]
+        rows.append(("Revenue inputs used",
+                     f"${v0 / 1e9:,.2f}B ({d0}) vs ${v1 / 1e9:,.2f}B ({d1})",
+                     "same fiscal quarter, 1 year apart", None, sales_src))
+    rows.append(("Quarterly sales growth YoY", _fmt(s, "%"), f">= {th['sales_q_min']:.0f}%",
+                 (s >= th["sales_q_min"]) if s is not None else None, sales_src))
     score = _clamp(g / th["eps_q_min"], 0, 1) * 70 if g < th["eps_q_min"] else 70
     score += 15 if accel else 0
     score += 15 if (s is not None and s >= th["sales_q_min"]) else 0
@@ -172,16 +189,18 @@ def eval_A(f: dict, th: dict) -> dict:
     if cagr is None and yrs is None and roe is None:
         return _letter("A", "Annual Earnings Increases", None, None, [],
                        "No annual earnings data available from any source.")
+    prov = f.get("prov", {})
+    a_src, roe_src = prov.get("eps_annual", ""), prov.get("roe", "")
     eps_str = " -> ".join(f"{y}: ${v:,.2f}" for y, v in (f["eps_annual"] or []))
     rows = [
-        ("Annual EPS history", eps_str or "n/a", "each year up", None),
+        ("Annual EPS history", eps_str or "n/a", "each year up", None, a_src),
         ("Years of EPS growth",
          f"{yrs[0]} of {yrs[1]}" if yrs else "n/a", "all (one dip ok)",
-         (yrs[0] >= yrs[1] - (1 if yrs[1] >= 3 else 0)) if yrs else None),
+         (yrs[0] >= yrs[1] - (1 if yrs[1] >= 3 else 0)) if yrs else None, a_src),
         ("EPS compounded growth", _fmt(cagr, "%"),
-         f">= {th['eps_cagr_min']:.0f}%", (cagr >= th["eps_cagr_min"]) if cagr is not None else None),
+         f">= {th['eps_cagr_min']:.0f}%", (cagr >= th["eps_cagr_min"]) if cagr is not None else None, a_src),
         ("Return on equity", _fmt(roe, "%"),
-         f">= {th['roe_min']:.0f}%", (roe >= th["roe_min"]) if roe is not None else None),
+         f">= {th['roe_min']:.0f}%", (roe >= th["roe_min"]) if roe is not None else None, roe_src),
     ]
     score = 0.0
     if yrs and yrs[1] > 0:
@@ -201,13 +220,14 @@ def eval_A(f: dict, th: dict) -> dict:
 def eval_N(p: dict, th: dict) -> dict:
     off = p["pct_off_high"]
     above_low = p["pct_above_low"]
+    src = p["source"]
     rows = [
         ("% below 52-week high", _fmt(off, "%"),
-         f"<= {th['off_high_max']:.0f}%", off <= th["off_high_max"]),
+         f"<= {th['off_high_max']:.0f}%", off <= th["off_high_max"], src),
         ("% above 52-week low", _fmt(above_low, "%"), ">= 30% (context)",
-         (above_low >= 30) if above_low is not None else None),
+         (above_low >= 30) if above_low is not None else None, src),
         ("52-week high / last close",
-         f"${p['high_52w']:,.2f} / ${p['last_close']:,.2f}", "near new highs", None),
+         f"${p['high_52w']:,.2f} / ${p['last_close']:,.2f}", "near new highs", None, src),
     ]
     score = _clamp(100 - off * (70 / max(th["off_high_max"], 1)) * 0.5 - max(off - th["off_high_max"], 0) * 2)
     passed = off <= th["off_high_max"]
@@ -221,27 +241,30 @@ def eval_S(f: dict, p: dict, th: dict) -> dict:
     shares = f["float_shares"] or f["shares_out"]
     ud = p["ud_vol_ratio"]
     de = f["debt_to_equity"]
+    prov = f.get("prov", {})
     rows = []
     score, weight = 0.0, 0.0
 
     if shares:
         m = shares / 1e6
         rows.append(("Float / shares outstanding", f"{m:,.0f}M",
-                     "smaller is better", m <= 1000))
+                     "smaller is better", m <= 1000, prov.get("shares", "")))
         size_score = 100 if m <= 50 else 85 if m <= 200 else 65 if m <= 1000 else 40 if m <= 5000 else 25
         score += size_score * 0.4
         weight += 0.4
     else:
-        rows.append(("Float / shares outstanding", "n/a", "smaller is better", None))
+        rows.append(("Float / shares outstanding", "n/a", "smaller is better", None, ""))
 
     if ud is not None:
         rows.append(("Up/down volume ratio (50d)", _fmt(ud, "", 2),
-                     f">= {th['ud_vol_min']:.1f} (demand)", ud >= th["ud_vol_min"]))
+                     f">= {th['ud_vol_min']:.1f} (demand)", ud >= th["ud_vol_min"],
+                     f"computed from last 50 sessions of {p['source']}"))
         score += _clamp(ud / 1.5, 0, 1) * 100 * 0.4
         weight += 0.4
 
     if de is not None:
-        rows.append(("Debt to equity", _fmt(de, "%", 0), "<= 100% (lower is safer)", de <= 100))
+        rows.append(("Debt to equity", _fmt(de, "%", 0), "<= 100% (lower is safer)",
+                     de <= 100, prov.get("debt", "")))
         score += (100 if de <= 40 else 70 if de <= 100 else 30) * 0.2
         weight += 0.2
 
@@ -253,15 +276,16 @@ def eval_S(f: dict, p: dict, th: dict) -> dict:
                    f"U/D volume {_fmt(ud, '', 2)}, float {_fmt(shares / 1e6 if shares else None, 'M', 0)}")
 
 
-def eval_L(rating: int | None, rs_at_high: bool | None, th: dict) -> dict:
+def eval_L(rating: int | None, rs_at_high: bool | None, th: dict, src: str = "") -> dict:
     if rating is None:
         return _letter("L", "Leader or Laggard", None, None, [],
                        "Not enough price history to compute relative strength.")
+    src = f"weighted 12-month return vs SPY; {src}" if src else ""
     rows = [
         ("RS rating (approx., vs S&P 500)", str(rating),
-         f">= {th['rs_min']:.0f} (winners avg 87)", rating >= th["rs_min"]),
+         f">= {th['rs_min']:.0f} (winners avg 87)", rating >= th["rs_min"], src),
         ("RS line near 52-week high", {True: "yes", False: "no", None: "n/a"}[rs_at_high],
-         "yes", rs_at_high),
+         "yes", rs_at_high, src),
     ]
     score = _clamp(rating + (5 if rs_at_high else 0), 0, 100)
     return _letter("L", "Leader or Laggard", round(score), rating >= th["rs_min"], rows,
@@ -275,11 +299,12 @@ def eval_I(f: dict, th: dict) -> dict:
         return _letter("I", "Institutional Sponsorship", None, None, [],
                        "No institutional ownership data available.")
     overowned = inst > th["inst_max"]
+    i_src = f.get("prov", {}).get("inst", "")
     rows = [
         ("Institutional ownership", _fmt(inst, "%"),
          f"{th['inst_min']:.0f}% - {th['inst_max']:.0f}%",
-         th["inst_min"] <= inst <= th["inst_max"]),
-        ("Insider ownership", _fmt(f["insider_pct"], "%"), "higher is a plus", None),
+         th["inst_min"] <= inst <= th["inst_max"], i_src),
+        ("Insider ownership", _fmt(f["insider_pct"], "%"), "higher is a plus", None, i_src),
     ]
     if inst < 5:
         score = 15.0
@@ -303,9 +328,10 @@ def liquidity_check(p: dict, th: dict) -> dict:
     return {
         "ok": ok_price and ok_vol,
         "rows": [
-            ("Share price", f"${p['last_close']:,.2f}", f">= ${th['min_price']:.0f}", ok_price),
+            ("Share price", f"${p['last_close']:,.2f}", f">= ${th['min_price']:.0f}",
+             ok_price, p["source"]),
             ("Avg daily volume (50d)", _fmt(p["avg_vol_50"], "", 0),
-             f">= {th['min_avg_vol']:,}", ok_vol),
+             f">= {th['min_avg_vol']:,}", ok_vol, p["source"]),
         ],
     }
 
@@ -379,7 +405,7 @@ def evaluate_stock(fund: dict, hist: pd.DataFrame, bench_hist: pd.DataFrame | No
         eval_A(fund, th),
         eval_N(p, th),
         eval_S(fund, p, th),
-        eval_L(rating, at_high, th),
+        eval_L(rating, at_high, th, p["source"]),
         eval_I(fund, th),
     ]
 
